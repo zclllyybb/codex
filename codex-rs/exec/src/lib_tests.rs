@@ -289,7 +289,7 @@ fn runtime_warnings_are_filtered_to_the_primary_thread() {
         should_process_notification(
             &ServerNotification::Warning(warning),
             primary_thread_id,
-            turn_id,
+            Some(turn_id),
         )
     });
 

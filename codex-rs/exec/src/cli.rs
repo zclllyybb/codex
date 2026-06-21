@@ -31,6 +31,15 @@ pub struct Cli {
     #[arg(long = "ephemeral", global = true, default_value_t = false)]
     pub ephemeral: bool,
 
+    /// Treat the prompt as a long-running goal and run it through goal mode.
+    #[arg(
+        long = "goal",
+        global = true,
+        default_value_t = false,
+        conflicts_with_all = ["ephemeral", "output_schema"]
+    )]
+    pub goal: bool,
+
     /// Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`.
     #[arg(long = "ignore-user-config", global = true, default_value_t = false)]
     pub ignore_user_config: bool,

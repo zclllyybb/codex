@@ -75,6 +75,14 @@ fn parses_config_isolation_flags() {
 }
 
 #[test]
+fn parses_goal_flag() {
+    let cli = Cli::parse_from(["codex-exec", "--goal", "finish the migration"]);
+
+    assert!(cli.goal);
+    assert_eq!(cli.prompt.as_deref(), Some("finish the migration"));
+}
+
+#[test]
 fn removed_full_auto_flag_reports_migration_path() {
     let cli = Cli::parse_from(["codex-exec", "--full-auto", "summarize"]);
 
