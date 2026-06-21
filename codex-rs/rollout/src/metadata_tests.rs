@@ -242,6 +242,79 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
 }
 
 #[tokio::test]
+async fn refresh_state_full_rescans_completed_backfill_and_old_watermark_paths() {
+    let dir = tempdir().expect("tempdir");
+    let codex_home = dir.path().to_path_buf();
+    let old_uuid = Uuid::new_v4();
+    let new_uuid = Uuid::new_v4();
+    let old_path = write_rollout_in_sessions(
+        codex_home.as_path(),
+        "2026-01-27T12-34-56",
+        "2026-01-27T12:34:56Z",
+        old_uuid,
+        /*git*/ None,
+    );
+    let new_path = write_rollout_in_sessions(
+        codex_home.as_path(),
+        "2026-01-27T12-35-56",
+        "2026-01-27T12:35:56Z",
+        new_uuid,
+        /*git*/ None,
+    );
+
+    let runtime = codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    runtime
+        .mark_backfill_complete(Some(
+            backfill_watermark_for_path(codex_home.as_path(), new_path.as_path()).as_str(),
+        ))
+        .await
+        .expect("mark backfill complete at newer watermark");
+
+    let report = refresh_state_from_sessions(
+        runtime.as_ref(),
+        codex_home.as_path(),
+        "test-provider",
+        BackfillMode::Full,
+    )
+    .await
+    .expect("refresh state from sessions");
+
+    assert_eq!(report.mode, BackfillMode::Full);
+    assert_eq!(report.status, BackfillReportStatus::Completed);
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.upserted, 2);
+    assert_eq!(report.failed, 0);
+    assert_eq!(
+        report.last_watermark,
+        Some(backfill_watermark_for_path(
+            codex_home.as_path(),
+            new_path.as_path()
+        ))
+    );
+
+    let old_id = ThreadId::from_string(&old_uuid.to_string()).expect("old thread id");
+    let new_id = ThreadId::from_string(&new_uuid.to_string()).expect("new thread id");
+    assert!(
+        runtime
+            .get_thread(old_id)
+            .await
+            .expect("get old thread")
+            .is_some(),
+        "full maintenance backfill must not skip a late-arriving old-path session"
+    );
+    assert!(
+        runtime
+            .get_thread(new_id)
+            .await
+            .expect("get new thread")
+            .is_some()
+    );
+    assert!(old_path < new_path);
+}
+
+#[tokio::test]
 async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_fields() {
     let dir = tempdir().expect("tempdir");
     let codex_home = dir.path().to_path_buf();

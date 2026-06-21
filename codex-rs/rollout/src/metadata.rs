@@ -14,7 +14,6 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
-use codex_state::BackfillState;
 use codex_state::BackfillStats;
 use codex_state::BackfillStatus;
 use codex_state::DB_ERROR_METRIC;
@@ -23,6 +22,7 @@ use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::apply_rollout_item;
+use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::info;
@@ -33,6 +33,37 @@ const BACKFILL_BATCH_SIZE: usize = 200;
 const BACKFILL_LEASE_SECONDS: i64 = 900;
 #[cfg(test)]
 const BACKFILL_LEASE_SECONDS: i64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackfillMode {
+    Incremental,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackfillReportStatus {
+    Completed,
+    SkippedComplete,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackfillReport {
+    pub mode: BackfillMode,
+    pub status: BackfillReportStatus,
+    pub scanned: usize,
+    pub upserted: usize,
+    pub failed: usize,
+    pub last_watermark: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillClaimMode {
+    Startup,
+    Maintenance,
+}
 
 pub(crate) fn builder_from_session_meta(
     session_meta: &SessionMetaLine,
@@ -150,31 +181,71 @@ pub(crate) async fn backfill_sessions_with_lease(
     default_provider: &str,
     backfill_lease_seconds: i64,
 ) {
+    if let Err(err) = run_backfill_sessions(
+        runtime,
+        codex_home,
+        default_provider,
+        backfill_lease_seconds,
+        BackfillMode::Incremental,
+        BackfillClaimMode::Startup,
+    )
+    .await
+    {
+        warn!(
+            "failed to backfill rollout metadata at {}: {err}",
+            codex_home.display()
+        );
+    }
+}
+
+/// Refreshes the state DB from session rollout files for explicit maintenance.
+pub async fn refresh_state_from_sessions(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_provider: &str,
+    mode: BackfillMode,
+) -> anyhow::Result<BackfillReport> {
+    run_backfill_sessions(
+        runtime,
+        codex_home,
+        default_provider,
+        BACKFILL_LEASE_SECONDS,
+        mode,
+        BackfillClaimMode::Maintenance,
+    )
+    .await
+}
+
+async fn run_backfill_sessions(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_provider: &str,
+    backfill_lease_seconds: i64,
+    mode: BackfillMode,
+    claim_mode: BackfillClaimMode,
+) -> anyhow::Result<BackfillReport> {
     let metric_client = codex_otel::global();
     let timer = metric_client
         .as_ref()
         .and_then(|otel| otel.start_timer(DB_METRIC_BACKFILL_DURATION_MS, &[]).ok());
-    let backfill_state = match runtime.get_backfill_state().await {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                "failed to read backfill state at {}: {err}",
-                codex_home.display()
-            );
-            BackfillState::default()
-        }
-    };
-    if backfill_state.status == BackfillStatus::Complete {
-        return;
+    let initial_state = runtime.get_backfill_state().await?;
+    if claim_mode == BackfillClaimMode::Startup && initial_state.status == BackfillStatus::Complete
+    {
+        return Ok(BackfillReport {
+            mode,
+            status: BackfillReportStatus::SkippedComplete,
+            scanned: 0,
+            upserted: 0,
+            failed: 0,
+            last_watermark: initial_state.last_watermark,
+        });
     }
-    let claimed = match runtime.try_claim_backfill(backfill_lease_seconds).await {
-        Ok(claimed) => claimed,
-        Err(err) => {
-            warn!(
-                "failed to claim backfill worker at {}: {err}",
-                codex_home.display()
-            );
-            return;
+    let claimed = match claim_mode {
+        BackfillClaimMode::Startup => runtime.try_claim_backfill(backfill_lease_seconds).await?,
+        BackfillClaimMode::Maintenance => {
+            runtime
+                .try_claim_backfill_for_maintenance(backfill_lease_seconds)
+                .await?
         }
     };
     if !claimed {
@@ -182,30 +253,19 @@ pub(crate) async fn backfill_sessions_with_lease(
             "state db backfill already running at {}; skipping duplicate worker",
             codex_home.display()
         );
-        return;
+        return Ok(BackfillReport {
+            mode,
+            status: BackfillReportStatus::AlreadyRunning,
+            scanned: 0,
+            upserted: 0,
+            failed: 0,
+            last_watermark: initial_state.last_watermark,
+        });
     }
-    let mut backfill_state = match runtime.get_backfill_state().await {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                "failed to read claimed backfill state at {}: {err}",
-                codex_home.display()
-            );
-            BackfillState {
-                status: BackfillStatus::Running,
-                ..Default::default()
-            }
-        }
-    };
+    let mut backfill_state = runtime.get_backfill_state().await?;
     if backfill_state.status != BackfillStatus::Running {
-        if let Err(err) = runtime.mark_backfill_running().await {
-            warn!(
-                "failed to mark backfill running at {}: {err}",
-                codex_home.display()
-            );
-        } else {
-            backfill_state.status = BackfillStatus::Running;
-        }
+        runtime.mark_backfill_running().await?;
+        backfill_state.status = BackfillStatus::Running;
     }
 
     let sessions_root = codex_home.join(SESSIONS_SUBDIR);
@@ -232,7 +292,9 @@ pub(crate) async fn backfill_sessions_with_lease(
         }
     }
     rollout_paths.sort_by(|a, b| a.watermark.cmp(&b.watermark));
-    if let Some(last_watermark) = backfill_state.last_watermark.as_deref() {
+    if mode == BackfillMode::Incremental
+        && let Some(last_watermark) = backfill_state.last_watermark.as_deref()
+    {
         rollout_paths.retain(|entry| entry.watermark.as_str() > last_watermark);
     }
 
@@ -298,28 +360,15 @@ pub(crate) async fn backfill_sessions_with_lease(
         }
 
         if let Some(last_entry) = batch.last() {
-            if let Err(err) = runtime
+            runtime
                 .checkpoint_backfill(last_entry.watermark.as_str())
-                .await
-            {
-                warn!(
-                    "failed to checkpoint backfill at {}: {err}",
-                    codex_home.display()
-                );
-            } else {
-                last_watermark = Some(last_entry.watermark.clone());
-            }
+                .await?;
+            last_watermark = Some(last_entry.watermark.clone());
         }
     }
-    if let Err(err) = runtime
+    runtime
         .mark_backfill_complete(last_watermark.as_deref())
-        .await
-    {
-        warn!(
-            "failed to mark backfill complete at {}: {err}",
-            codex_home.display()
-        );
-    }
+        .await?;
 
     info!(
         "state db backfill scanned={}, upserted={}, failed={}",
@@ -347,6 +396,14 @@ pub(crate) async fn backfill_sessions_with_lease(
         };
         let _ = timer.record(&[("status", status)]);
     }
+    Ok(BackfillReport {
+        mode,
+        status: BackfillReportStatus::Completed,
+        scanned: stats.scanned,
+        upserted: stats.upserted,
+        failed: stats.failed,
+        last_watermark,
+    })
 }
 
 #[derive(Debug, Clone)]

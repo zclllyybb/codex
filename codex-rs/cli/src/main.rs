@@ -67,12 +67,19 @@ use doctor::DoctorCommand;
 use state_db_recovery as local_state_db;
 
 use codex_config::LoaderOverrides;
+use codex_core::StartThreadOptions;
+use codex_core::ThreadManager;
 use codex_core::build_models_manager;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
 use codex_core::config::resolve_profile_v2_config_path;
+use codex_core::resolve_installation_id;
+use codex_core::thread_store_from_config;
+use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecServerRuntimePaths;
+use codex_extension_api::empty_extension_registry;
 use codex_features::FEATURES;
 use codex_features::Stage;
 use codex_features::is_known_feature_key;
@@ -80,10 +87,17 @@ use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::read_codex_access_token_from_env;
+use codex_memories_write::MemoryMaintenanceOptions;
+use codex_memories_write::MemoryMaintenanceReport;
 use codex_memories_write::clear_memory_roots_contents;
+use codex_memories_write::maintain_memories;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::user_input::UserInput;
 use codex_terminal_detection::TerminalName;
 
@@ -139,6 +153,9 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
+
+    /// Manage Codex memories.
+    Memory(MemoryCommand),
 
     /// Start Codex as an MCP server (stdio).
     McpServer(McpServerCommand),
@@ -221,6 +238,29 @@ struct CompletionCommand {
 struct DebugCommand {
     #[command(subcommand)]
     subcommand: DebugSubcommand,
+}
+
+#[derive(Debug, Parser)]
+struct MemoryCommand {
+    #[command(subcommand)]
+    subcommand: MemorySubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum MemorySubcommand {
+    /// Run memory generation and consolidation to completion.
+    Maintain(MemoryMaintainCommand),
+}
+
+#[derive(Debug, Parser)]
+struct MemoryMaintainCommand {
+    /// Wait until all memory maintenance work has completed.
+    #[arg(long)]
+    wait: bool,
+
+    /// Emit a JSON report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -1060,6 +1100,15 @@ async fn cli_main(
                 loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?;
             mcp_cli.run(loader_overrides).await?;
         }
+        Some(Subcommand::Memory(cmd)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "memory",
+            )?;
+            run_memory_command(cmd, &arg0_paths, &root_config_overrides, root_strict_config)
+                .await?;
+        }
         Some(Subcommand::Plugin(plugin_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -1657,6 +1706,7 @@ fn profile_v2_for_subcommand<'a>(
     match subcommand {
         Subcommand::Exec(_)
         | Subcommand::Review(_)
+        | Subcommand::Memory(_)
         | Subcommand::Resume(_)
         | Subcommand::Archive(_)
         | Subcommand::Delete(_)
@@ -1668,7 +1718,7 @@ fn profile_v2_for_subcommand<'a>(
             subcommand: DebugSubcommand::PromptInput(_),
         }) => Ok(Some(profile_v2)),
         _ => anyhow::bail!(
-            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
+            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex memory`, `codex resume`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
         ),
     }
 }
@@ -2032,6 +2082,158 @@ async fn run_debug_clear_memories_command(
     Ok(())
 }
 
+async fn run_memory_command(
+    cmd: MemoryCommand,
+    arg0_paths: &Arg0DispatchPaths,
+    root_config_overrides: &CliConfigOverrides,
+    strict_config: bool,
+) -> anyhow::Result<()> {
+    match cmd.subcommand {
+        MemorySubcommand::Maintain(cmd) => {
+            run_memory_maintain_command(cmd, arg0_paths, root_config_overrides, strict_config).await
+        }
+    }
+}
+
+async fn run_memory_maintain_command(
+    cmd: MemoryMaintainCommand,
+    arg0_paths: &Arg0DispatchPaths,
+    root_config_overrides: &CliConfigOverrides,
+    strict_config: bool,
+) -> anyhow::Result<()> {
+    if !cmd.wait {
+        anyhow::bail!("`codex memory maintain` requires --wait to guarantee completion");
+    }
+
+    let cli_kv_overrides = root_config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    let mut config = ConfigBuilder::default()
+        .cli_overrides(cli_kv_overrides)
+        .strict_config(strict_config)
+        .build()
+        .await?;
+    config.ephemeral = false;
+    config.memories.generate_memories = false;
+    config.memories.use_memories = false;
+    let config = Arc::new(config);
+
+    let auth_manager =
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ true).await;
+    let state_db =
+        StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone()).await?;
+    let thread_store = thread_store_from_config(config.as_ref(), Some(Arc::clone(&state_db)));
+    let runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        arg0_paths.codex_self_exe.clone(),
+        arg0_paths.codex_linux_sandbox_exe.clone(),
+    )?;
+    let environment_manager = Arc::new(
+        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(runtime_paths)).await?,
+    );
+    let installation_id = resolve_installation_id(&config.codex_home).await?;
+    let session_source = SessionSource::Internal(InternalSessionSource::MemoryConsolidation);
+    let thread_manager = Arc::new(ThreadManager::new(
+        config.as_ref(),
+        Arc::clone(&auth_manager),
+        session_source.clone(),
+        environment_manager,
+        empty_extension_registry(),
+        Arc::new(CodexHomeUserInstructionsProvider::new(
+            config.codex_home.clone(),
+        )),
+        None,
+        Arc::clone(&thread_store),
+        Some(Arc::clone(&state_db)),
+        installation_id,
+        None,
+    ));
+
+    let environments = thread_manager.default_environment_selections(&config.cwd);
+    let new_thread = thread_manager
+        .start_thread_with_options(StartThreadOptions {
+            config: config.as_ref().clone(),
+            initial_history: InitialHistory::New,
+            session_source: Some(session_source),
+            thread_source: Some(ThreadSource::MemoryConsolidation),
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments,
+            thread_extension_init: Default::default(),
+        })
+        .await?;
+    let thread_id = new_thread.thread_id;
+    let thread = new_thread.thread;
+
+    let report_result = maintain_memories(
+        Arc::clone(&thread_manager),
+        Arc::clone(&auth_manager),
+        thread_id,
+        Arc::clone(&thread),
+        Arc::clone(&config),
+        MemoryMaintenanceOptions::default(),
+    )
+    .await;
+    let thread = thread_manager
+        .remove_thread(&thread_id)
+        .await
+        .unwrap_or(thread);
+    let shutdown_result = thread.shutdown_and_wait().await;
+    state_db.close().await;
+
+    let mut report = match report_result {
+        Ok(report) => report,
+        Err(err) => {
+            failed_memory_maintenance_report(config.as_ref(), "failed_maintenance", err.to_string())
+        }
+    };
+    if let Err(err) = shutdown_result {
+        if report.succeeded() {
+            report.status = "failed_shutdown".to_string();
+        }
+        let shutdown_reason = format!("failed to shut down memory maintenance thread: {err}");
+        report.failure_reason = Some(match report.failure_reason.take() {
+            Some(existing) => format!("{existing}; {shutdown_reason}"),
+            None => shutdown_reason,
+        });
+    }
+
+    if cmd.json {
+        serde_json::to_writer_pretty(std::io::stdout(), &report)?;
+        println!();
+    } else {
+        println!("memory maintenance status: {}", report.status);
+    }
+
+    if !report.succeeded() {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn failed_memory_maintenance_report(
+    config: &codex_core::config::Config,
+    status: &'static str,
+    reason: String,
+) -> MemoryMaintenanceReport {
+    MemoryMaintenanceReport {
+        status: status.to_string(),
+        memory_root: codex_memories_write::memory_root(&config.codex_home)
+            .to_string_lossy()
+            .to_string(),
+        lock_path: config
+            .sqlite_home
+            .join("memory-maintain.lock")
+            .to_string_lossy()
+            .to_string(),
+        failure_reason: Some(reason),
+        backfill: None,
+        phase1: None,
+        phase2: None,
+    }
+}
+
 /// Prepend root-level overrides so they have lower precedence than
 /// CLI-specific ones specified after the subcommand (if any).
 fn prepend_config_flags(
@@ -2094,6 +2296,7 @@ fn unsupported_subcommand_name_for_strict_config(
         None
         | Some(Subcommand::Exec(_))
         | Some(Subcommand::Review(_))
+        | Some(Subcommand::Memory(_))
         | Some(Subcommand::McpServer(_))
         | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))
@@ -2541,6 +2744,21 @@ mod tests {
             error.to_string(),
             "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
         );
+    }
+
+    #[test]
+    fn parses_memory_maintain_wait_json() {
+        let cli = MultitoolCli::try_parse_from(["codex", "memory", "maintain", "--wait", "--json"])
+            .expect("parse");
+
+        let Some(Subcommand::Memory(MemoryCommand {
+            subcommand: MemorySubcommand::Maintain(cmd),
+        })) = cli.subcommand
+        else {
+            panic!("expected memory maintain subcommand");
+        };
+        assert!(cmd.wait);
+        assert!(cmd.json);
     }
 
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {

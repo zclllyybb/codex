@@ -43,6 +43,36 @@ WHERE id = 1
         Ok(result.rows_affected() == 1)
     }
 
+    /// Attempt to claim rollout metadata backfill for an explicit maintenance
+    /// pass.
+    ///
+    /// Unlike [`Self::try_claim_backfill`], this can claim a previously
+    /// completed backfill row so a batch process can refresh state from new or
+    /// copied session files.
+    pub async fn try_claim_backfill_for_maintenance(
+        &self,
+        lease_seconds: i64,
+    ) -> anyhow::Result<bool> {
+        self.ensure_backfill_state_row().await?;
+        let now = Utc::now().timestamp();
+        let lease_cutoff = now.saturating_sub(lease_seconds.max(0));
+        let result = sqlx::query(
+            r#"
+UPDATE backfill_state
+SET status = ?, updated_at = ?
+WHERE id = 1
+  AND (status != ? OR updated_at <= ?)
+            "#,
+        )
+        .bind(crate::BackfillStatus::Running.as_str())
+        .bind(now)
+        .bind(crate::BackfillStatus::Running.as_str())
+        .bind(lease_cutoff)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Mark rollout metadata backfill as running.
     pub async fn mark_backfill_running(&self) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
@@ -272,6 +302,46 @@ WHERE id = 1
             .await
             .expect("claim after complete");
         assert_eq!(claim_after_complete, false);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_backfill_can_claim_after_complete_but_respects_running_lease() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        runtime
+            .mark_backfill_complete(Some("sessions/2026/01/28/rollout-b.jsonl"))
+            .await
+            .expect("mark complete");
+
+        assert_eq!(
+            runtime
+                .try_claim_backfill(/*lease_seconds*/ 3_600)
+                .await
+                .expect("regular claim after complete"),
+            false,
+            "regular startup backfill should not claim a completed row"
+        );
+        assert_eq!(
+            runtime
+                .try_claim_backfill_for_maintenance(/*lease_seconds*/ 3_600)
+                .await
+                .expect("maintenance claim after complete"),
+            true,
+            "maintenance backfill should refresh even after a completed row"
+        );
+        assert_eq!(
+            runtime
+                .try_claim_backfill_for_maintenance(/*lease_seconds*/ 3_600)
+                .await
+                .expect("duplicate maintenance claim"),
+            false,
+            "maintenance backfill should still respect a fresh running lease"
+        );
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

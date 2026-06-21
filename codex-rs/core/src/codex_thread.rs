@@ -415,8 +415,12 @@ impl CodexThread {
             .await
     }
 
-    pub(crate) fn subscribe_status(&self) -> watch::Receiver<AgentStatus> {
+    pub fn subscribe_agent_status(&self) -> watch::Receiver<AgentStatus> {
         self.codex.agent_status.clone()
+    }
+
+    pub(crate) fn subscribe_status(&self) -> watch::Receiver<AgentStatus> {
+        self.subscribe_agent_status()
     }
 
     /// Returns the complete token usage snapshot currently cached for this thread.

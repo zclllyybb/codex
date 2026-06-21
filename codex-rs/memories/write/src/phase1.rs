@@ -20,6 +20,7 @@ use codex_rollout::should_persist_response_item_for_memories;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
@@ -39,12 +40,71 @@ enum JobOutcome {
     Failed,
 }
 
-struct Stats {
-    claimed: usize,
-    succeeded_with_output: usize,
-    succeeded_no_output: usize,
-    failed: usize,
-    total_token_usage: Option<TokenUsage>,
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Stats {
+    pub claimed: usize,
+    pub succeeded_with_output: usize,
+    pub succeeded_no_output: usize,
+    pub failed: usize,
+    pub total_token_usage: Option<TokenUsage>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Phase1DrainOptions {
+    pub max_claimed_per_batch: usize,
+    pub min_rollout_idle_hours: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Phase1DrainReport {
+    pub iterations: usize,
+    pub scanned: usize,
+    pub skipped_up_to_date: usize,
+    #[serde(flatten)]
+    pub stats: Stats,
+    pub skipped_running: Vec<codex_state::MemoryJobSnapshot>,
+    pub skipped_retry_backoff: Vec<codex_state::MemoryJobSnapshot>,
+    pub skipped_retry_exhausted: Vec<codex_state::MemoryJobSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub infrastructure_error: Option<String>,
+}
+
+impl Phase1DrainReport {
+    pub fn has_blockers(&self) -> bool {
+        !self.skipped_running.is_empty()
+            || !self.skipped_retry_backoff.is_empty()
+            || !self.skipped_retry_exhausted.is_empty()
+            || self.infrastructure_error.is_some()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.stats.failed > 0
+    }
+
+    fn add_stats(&mut self, stats: Stats) {
+        self.stats.claimed += stats.claimed;
+        self.stats.succeeded_with_output += stats.succeeded_with_output;
+        self.stats.succeeded_no_output += stats.succeeded_no_output;
+        self.stats.failed += stats.failed;
+        match (
+            self.stats.total_token_usage.as_mut(),
+            stats.total_token_usage.as_ref(),
+        ) {
+            (Some(total), Some(delta)) => total.add_assign(delta),
+            (None, Some(delta)) => self.stats.total_token_usage = Some(delta.clone()),
+            (Some(_), None) | (None, None) => {}
+        }
+    }
+
+    fn add_claim_batch(&mut self, batch: codex_state::Stage1ClaimBatch) {
+        self.scanned += batch.scanned;
+        self.skipped_up_to_date += batch.skipped_up_to_date;
+        self.skipped_running.extend(batch.skipped_running);
+        self.skipped_retry_backoff
+            .extend(batch.skipped_retry_backoff);
+        self.skipped_retry_exhausted
+            .extend(batch.skipped_retry_exhausted);
+    }
 }
 
 /// Phase 1 model output payload.
@@ -105,6 +165,63 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
         counts.succeeded_no_output,
         counts.failed
     );
+}
+
+pub(crate) async fn drain_for_maintenance(
+    context: Arc<MemoryStartupContext>,
+    config: Arc<Config>,
+    options: Phase1DrainOptions,
+) -> Phase1DrainReport {
+    let stage_one_context = build_request_context(context.as_ref(), config.as_ref()).await;
+    let _phase_one_e2e_timer = stage_one_context.start_timer(MEMORY_PHASE_ONE_E2E_MS);
+    let mut report = Phase1DrainReport::default();
+
+    loop {
+        let claimed_batch =
+            match claim_maintenance_jobs(context.as_ref(), &config.memories, &options).await {
+                Ok(batch) => batch,
+                Err(err) => {
+                    report.infrastructure_error = Some(err);
+                    return report;
+                }
+            };
+        let claims = claimed_batch.claims.clone();
+        report.add_claim_batch(claimed_batch);
+
+        if claims.is_empty() {
+            if report.stats.claimed == 0 {
+                stage_one_context.counter(
+                    MEMORY_PHASE_ONE_JOBS,
+                    /*inc*/ 1,
+                    &[("status", "skipped_no_candidates")],
+                );
+            }
+            return report;
+        }
+
+        report.iterations += 1;
+        let outcomes = run_jobs(
+            Arc::clone(&context),
+            Arc::clone(&config),
+            claims,
+            stage_one_context.clone(),
+        )
+        .await;
+        let counts = aggregate_stats(outcomes);
+        emit_metrics(&stage_one_context, &counts);
+        info!(
+            "memory stage-1 maintenance iteration complete: {} job(s) claimed, {} succeeded ({} with output, {} no output), {} failed",
+            counts.claimed,
+            counts.succeeded_with_output + counts.succeeded_no_output,
+            counts.succeeded_with_output,
+            counts.succeeded_no_output,
+            counts.failed
+        );
+        report.add_stats(counts);
+        if report.has_failures() || report.has_blockers() {
+            return report;
+        }
+    }
 }
 
 /// Prune old un-used "dead" raw memories.
@@ -184,6 +301,37 @@ async fn claim_startup_jobs(
             None
         }
     }
+}
+
+async fn claim_maintenance_jobs(
+    context: &MemoryStartupContext,
+    memories_config: &MemoriesConfig,
+    options: &Phase1DrainOptions,
+) -> Result<codex_state::Stage1ClaimBatch, String> {
+    let Some(state_db) = context.state_db() else {
+        return Err("state db unavailable while claiming phase-1 maintenance jobs".to_string());
+    };
+
+    let allowed_sources = INTERACTIVE_SESSION_SOURCES
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    state_db
+        .memories()
+        .claim_stage1_jobs_for_maintenance(
+            context.thread_id(),
+            codex_state::Stage1MaintenanceClaimParams {
+                scan_limit: crate::stage_one::THREAD_SCAN_LIMIT,
+                max_claimed: options.max_claimed_per_batch,
+                max_age_days: memories_config.max_rollout_age_days,
+                min_rollout_idle_hours: options.min_rollout_idle_hours,
+                allowed_sources: allowed_sources.as_slice(),
+                lease_seconds: crate::stage_one::JOB_LEASE_SECONDS,
+            },
+        )
+        .await
+        .map_err(|err| format!("memories db claim_stage1_jobs_for_maintenance failed: {err}"))
 }
 
 async fn build_request_context(

@@ -7,6 +7,7 @@
 mod control;
 mod extensions;
 mod guard;
+mod maintenance;
 mod metrics;
 mod phase1;
 mod phase2;
@@ -22,6 +23,9 @@ use std::path::PathBuf;
 
 pub use control::clear_memory_roots_contents;
 pub use extensions::prune_old_extension_resources;
+pub use maintenance::MemoryMaintenanceOptions;
+pub use maintenance::MemoryMaintenanceReport;
+pub use maintenance::maintain_memories;
 pub use prompts::build_consolidation_prompt;
 pub use prompts::build_stage_one_input_message;
 pub use start::start_memories_startup_task;

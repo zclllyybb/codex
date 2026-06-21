@@ -2,9 +2,13 @@ use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::*;
 use crate::SortDirection;
+use crate::model::MemoryJobSnapshot;
+use crate::model::Phase2ClaimMode;
 use crate::model::Phase2JobClaimOutcome;
+use crate::model::Stage1ClaimBatch;
 use crate::model::Stage1JobClaim;
 use crate::model::Stage1JobClaimOutcome;
+use crate::model::Stage1MaintenanceClaimParams;
 use crate::model::Stage1Output;
 use crate::model::Stage1StartupClaimParams;
 use crate::model::ThreadRow;
@@ -163,7 +167,147 @@ WHERE kind = ? AND job_key = ?
         }
 
         let worker_id = current_thread_id;
-        let current_thread_id = worker_id.to_string();
+        let items = self
+            .select_stage1_candidate_threads(
+                current_thread_id,
+                scan_limit,
+                max_age_days,
+                min_rollout_idle_hours,
+                allowed_sources,
+            )
+            .await?;
+
+        let mut claimed = Vec::new();
+        for item in items {
+            if claimed.len() >= max_claimed {
+                break;
+            }
+            if !self
+                .stage1_source_needs_update(item.id, item.updated_at.timestamp())
+                .await?
+            {
+                continue;
+            }
+
+            if let Stage1JobClaimOutcome::Claimed { ownership_token } = self
+                .try_claim_stage1_job(
+                    item.id,
+                    worker_id,
+                    item.updated_at.timestamp(),
+                    lease_seconds,
+                    max_claimed,
+                )
+                .await?
+            {
+                claimed.push(Stage1JobClaim {
+                    thread: item,
+                    ownership_token,
+                });
+            }
+        }
+
+        Ok(claimed)
+    }
+
+    /// Selects and claims stage-1 jobs while preserving skip reasons.
+    ///
+    /// Dedicated maintenance commands use this API to drain all immediately
+    /// claimable work and fail explicitly on active leases, retry backoff, or
+    /// exhausted retry rows instead of treating every non-claim as "no work".
+    pub async fn claim_stage1_jobs_for_maintenance(
+        &self,
+        current_thread_id: ThreadId,
+        params: Stage1MaintenanceClaimParams<'_>,
+    ) -> anyhow::Result<Stage1ClaimBatch> {
+        let Stage1MaintenanceClaimParams {
+            scan_limit,
+            max_claimed,
+            max_age_days,
+            min_rollout_idle_hours,
+            allowed_sources,
+            lease_seconds,
+        } = params;
+        if scan_limit == 0 || max_claimed == 0 {
+            return Ok(Stage1ClaimBatch::default());
+        }
+
+        let worker_id = current_thread_id;
+        let items = self
+            .select_stage1_candidate_threads(
+                current_thread_id,
+                scan_limit,
+                max_age_days,
+                min_rollout_idle_hours,
+                allowed_sources,
+            )
+            .await?;
+
+        let mut batch = Stage1ClaimBatch::default();
+        for item in items {
+            if batch.claims.len() >= max_claimed {
+                break;
+            }
+            batch.scanned += 1;
+            if !self
+                .stage1_source_needs_update(item.id, item.updated_at.timestamp())
+                .await?
+            {
+                batch.skipped_up_to_date += 1;
+                continue;
+            }
+
+            match self
+                .try_claim_stage1_job(
+                    item.id,
+                    worker_id,
+                    item.updated_at.timestamp(),
+                    lease_seconds,
+                    max_claimed,
+                )
+                .await?
+            {
+                Stage1JobClaimOutcome::Claimed { ownership_token } => {
+                    batch.claims.push(Stage1JobClaim {
+                        thread: item,
+                        ownership_token,
+                    });
+                }
+                Stage1JobClaimOutcome::SkippedUpToDate => {
+                    batch.skipped_up_to_date += 1;
+                }
+                Stage1JobClaimOutcome::SkippedRunning => {
+                    batch.skipped_running.push(
+                        self.fetch_stage1_job_snapshot_or_status(item.id, "running")
+                            .await?,
+                    );
+                }
+                Stage1JobClaimOutcome::SkippedRetryBackoff => {
+                    batch.skipped_retry_backoff.push(
+                        self.fetch_stage1_job_snapshot_or_status(item.id, "retry_backoff")
+                            .await?,
+                    );
+                }
+                Stage1JobClaimOutcome::SkippedRetryExhausted => {
+                    batch.skipped_retry_exhausted.push(
+                        self.fetch_stage1_job_snapshot_or_status(item.id, "retry_exhausted")
+                            .await?,
+                    );
+                }
+            }
+        }
+
+        Ok(batch)
+    }
+
+    async fn select_stage1_candidate_threads(
+        &self,
+        current_thread_id: ThreadId,
+        scan_limit: usize,
+        max_age_days: i64,
+        min_rollout_idle_hours: i64,
+        allowed_sources: &[String],
+    ) -> anyhow::Result<Vec<ThreadMetadata>> {
+        let current_thread_id = current_thread_id.to_string();
         let max_age_cutoff = (Utc::now() - Duration::days(max_age_days.max(0))).timestamp_millis();
         let idle_cutoff =
             (Utc::now() - Duration::hours(min_rollout_idle_hours.max(0))).timestamp_millis();
@@ -229,44 +373,81 @@ FROM threads
         builder.push(" ORDER BY threads.updated_at_ms DESC LIMIT ");
         builder.push_bind(scan_limit_i64);
 
-        let items = builder
+        builder
             .build()
             .fetch_all(self.state_pool.as_ref())
             .await?
             .into_iter()
             .map(|row| ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+    }
 
-        let mut claimed = Vec::new();
-        for item in items {
-            if claimed.len() >= max_claimed {
-                break;
-            }
-            if !self
-                .stage1_source_needs_update(item.id, item.updated_at.timestamp())
-                .await?
-            {
-                continue;
-            }
+    /// Returns a snapshot of a memory job row, if present.
+    pub async fn fetch_memory_job_snapshot(
+        &self,
+        kind: &str,
+        job_key: &str,
+    ) -> anyhow::Result<Option<MemoryJobSnapshot>> {
+        let row = sqlx::query(
+            r#"
+SELECT
+    kind,
+    job_key,
+    status,
+    worker_id,
+    started_at,
+    finished_at,
+    lease_until,
+    retry_at,
+    retry_remaining,
+    last_error,
+    input_watermark,
+    last_success_watermark
+FROM jobs
+WHERE kind = ? AND job_key = ?
+            "#,
+        )
+        .bind(kind)
+        .bind(job_key)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
 
-            if let Stage1JobClaimOutcome::Claimed { ownership_token } = self
-                .try_claim_stage1_job(
-                    item.id,
-                    worker_id,
-                    item.updated_at.timestamp(),
-                    lease_seconds,
-                    max_claimed,
-                )
-                .await?
-            {
-                claimed.push(Stage1JobClaim {
-                    thread: item,
-                    ownership_token,
-                });
-            }
-        }
+        row.map(|row| memory_job_snapshot_from_row(&row))
+            .transpose()
+    }
 
-        Ok(claimed)
+    async fn fetch_stage1_job_snapshot_or_status(
+        &self,
+        thread_id: ThreadId,
+        fallback_status: &str,
+    ) -> anyhow::Result<MemoryJobSnapshot> {
+        let job_key = thread_id.to_string();
+        Ok(self
+            .fetch_memory_job_snapshot(JOB_KIND_MEMORY_STAGE1, job_key.as_str())
+            .await?
+            .unwrap_or_else(|| MemoryJobSnapshot {
+                kind: JOB_KIND_MEMORY_STAGE1.to_string(),
+                job_key,
+                status: fallback_status.to_string(),
+                worker_id: None,
+                started_at: None,
+                finished_at: None,
+                lease_until: None,
+                retry_at: None,
+                retry_remaining: 0,
+                last_error: None,
+                input_watermark: None,
+                last_success_watermark: None,
+            }))
+    }
+
+    /// Returns the singleton global phase-2 job snapshot, if it exists.
+    pub async fn global_phase2_job_snapshot(&self) -> anyhow::Result<Option<MemoryJobSnapshot>> {
+        self.fetch_memory_job_snapshot(
+            JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL,
+            MEMORY_CONSOLIDATION_JOB_KEY,
+        )
+        .await
     }
 
     pub(super) async fn delete_thread_memory(&self, thread_id: ThreadId) -> anyhow::Result<()> {
@@ -1041,9 +1222,29 @@ WHERE kind = ? AND job_key = ?
         worker_id: ThreadId,
         lease_seconds: i64,
     ) -> anyhow::Result<Phase2JobClaimOutcome> {
+        self.try_claim_global_phase2_job_with_mode(
+            worker_id,
+            lease_seconds,
+            Phase2ClaimMode::Startup,
+        )
+        .await
+    }
+
+    /// Attempts to claim the global phase-2 lock with explicit cooldown mode.
+    pub async fn try_claim_global_phase2_job_with_mode(
+        &self,
+        worker_id: ThreadId,
+        lease_seconds: i64,
+        mode: Phase2ClaimMode,
+    ) -> anyhow::Result<Phase2JobClaimOutcome> {
         let now = Utc::now().timestamp();
         let lease_until = now.saturating_add(lease_seconds.max(0));
-        let cooldown_cutoff = now.saturating_sub(PHASE2_SUCCESS_COOLDOWN_SECONDS);
+        let respect_success_cooldown = matches!(mode, Phase2ClaimMode::Startup);
+        let cooldown_cutoff = if respect_success_cooldown {
+            now.saturating_sub(PHASE2_SUCCESS_COOLDOWN_SECONDS)
+        } else {
+            i64::MAX
+        };
         let ownership_token = Uuid::new_v4().to_string();
         let worker_id = worker_id.to_string();
 
@@ -1119,7 +1320,8 @@ INSERT INTO jobs (
             tx.commit().await?;
             return Ok(Phase2JobClaimOutcome::SkippedRunning);
         }
-        if last_error.is_none()
+        if respect_success_cooldown
+            && last_error.is_none()
             && finished_at.is_some_and(|finished_at| finished_at > cooldown_cutoff)
         {
             tx.commit().await?;
@@ -1424,6 +1626,25 @@ fn stage1_output_from_row_and_thread(
     })
 }
 
+fn memory_job_snapshot_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<MemoryJobSnapshot> {
+    Ok(MemoryJobSnapshot {
+        kind: row.try_get("kind")?,
+        job_key: row.try_get("job_key")?,
+        status: row.try_get("status")?,
+        worker_id: row.try_get("worker_id")?,
+        started_at: row.try_get("started_at")?,
+        finished_at: row.try_get("finished_at")?,
+        lease_until: row.try_get("lease_until")?,
+        retry_at: row.try_get("retry_at")?,
+        retry_remaining: row.try_get("retry_remaining")?,
+        last_error: row.try_get("last_error")?,
+        input_watermark: row.try_get("input_watermark")?,
+        last_success_watermark: row.try_get("last_success_watermark")?,
+    })
+}
+
 fn datetime_from_epoch_seconds(secs: i64) -> anyhow::Result<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(secs, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp: {secs}"))
@@ -1664,8 +1885,10 @@ mod tests {
     use super::StateRuntime;
     use super::test_support::test_thread_metadata;
     use super::test_support::unique_temp_dir;
+    use crate::model::Phase2ClaimMode;
     use crate::model::Phase2JobClaimOutcome;
     use crate::model::Stage1JobClaimOutcome;
+    use crate::model::Stage1MaintenanceClaimParams;
     use crate::model::Stage1StartupClaimParams;
     use chrono::Duration;
     use chrono::Utc;
@@ -2224,6 +2447,82 @@ mod tests {
 
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].thread.id, enabled_thread_id);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_stage1_claim_reports_running_blockers() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        let current_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("current thread id");
+        let blocked_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("blocked thread id");
+        let worker_id = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("worker id");
+
+        let now = Utc::now();
+        let mut current =
+            test_thread_metadata(&codex_home, current_thread_id, codex_home.join("current"));
+        current.created_at = now;
+        current.updated_at = now;
+        runtime
+            .upsert_thread(&current)
+            .await
+            .expect("upsert current thread");
+
+        let mut blocked =
+            test_thread_metadata(&codex_home, blocked_thread_id, codex_home.join("blocked"));
+        blocked.created_at = now - Duration::hours(1);
+        blocked.updated_at = now - Duration::hours(1);
+        runtime
+            .upsert_thread(&blocked)
+            .await
+            .expect("upsert blocked thread");
+
+        let initial_claim = runtime
+            .try_claim_stage1_job(
+                blocked_thread_id,
+                worker_id,
+                blocked.updated_at.timestamp(),
+                /*lease_seconds*/ 3_600,
+                /*max_running_jobs*/ 64,
+            )
+            .await
+            .expect("seed running stage1 job");
+        assert!(
+            matches!(initial_claim, Stage1JobClaimOutcome::Claimed { .. }),
+            "seed claim should hold a fresh running lease"
+        );
+
+        let allowed_sources = vec!["cli".to_string()];
+        let batch = runtime
+            .memories()
+            .claim_stage1_jobs_for_maintenance(
+                current_thread_id,
+                Stage1MaintenanceClaimParams {
+                    scan_limit: 10,
+                    max_claimed: 10,
+                    max_age_days: 30,
+                    min_rollout_idle_hours: 0,
+                    allowed_sources: allowed_sources.as_slice(),
+                    lease_seconds: 3_600,
+                },
+            )
+            .await
+            .expect("claim maintenance stage1 jobs");
+
+        assert_eq!(batch.claims, Vec::new());
+        assert_eq!(batch.skipped_running.len(), 1);
+        assert_eq!(batch.skipped_running[0].kind, JOB_KIND_MEMORY_STAGE1);
+        assert_eq!(
+            batch.skipped_running[0].job_key,
+            blocked_thread_id.to_string()
+        );
+        assert_eq!(batch.skipped_running[0].status, "running");
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
@@ -5059,6 +5358,72 @@ VALUES (?, ?, ?, ?, ?)
             .await
             .expect("claim global phase2 lock after success");
         assert_eq!(claim_after_success, Phase2JobClaimOutcome::SkippedCooldown);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_phase2_claim_bypasses_success_cooldown() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        runtime
+            .enqueue_global_consolidation(/*input_watermark*/ 500)
+            .await
+            .expect("enqueue global consolidation");
+
+        let owner_a = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner a");
+        let owner_b = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner b");
+        let owner_c = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner c");
+
+        let claim = runtime
+            .try_claim_global_phase2_job(owner_a, /*lease_seconds*/ 3_600)
+            .await
+            .expect("claim global phase2 lock");
+        let ownership_token = match claim {
+            Phase2JobClaimOutcome::Claimed {
+                ownership_token,
+                input_watermark,
+            } => {
+                assert_eq!(input_watermark, 500);
+                ownership_token
+            }
+            other => panic!("unexpected phase2 claim outcome: {other:?}"),
+        };
+        assert!(
+            runtime
+                .mark_global_phase2_job_succeeded(
+                    ownership_token.as_str(),
+                    /*completed_watermark*/ 500,
+                    &[]
+                )
+                .await
+                .expect("mark phase2 lock success")
+        );
+
+        let startup_claim = runtime
+            .try_claim_global_phase2_job(owner_b, /*lease_seconds*/ 3_600)
+            .await
+            .expect("startup claim during cooldown");
+        assert_eq!(startup_claim, Phase2JobClaimOutcome::SkippedCooldown);
+
+        let maintenance_claim = runtime
+            .memories()
+            .try_claim_global_phase2_job_with_mode(
+                owner_c,
+                /*lease_seconds*/ 3_600,
+                Phase2ClaimMode::MaintenanceBypassCooldown,
+            )
+            .await
+            .expect("maintenance claim during cooldown");
+        match maintenance_claim {
+            Phase2JobClaimOutcome::Claimed {
+                input_watermark, ..
+            } => assert_eq!(input_watermark, 500),
+            other => panic!("unexpected maintenance claim outcome: {other:?}"),
+        }
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
