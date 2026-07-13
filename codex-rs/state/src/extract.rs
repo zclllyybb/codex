@@ -1,4 +1,5 @@
 use crate::model::ThreadMetadata;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
@@ -10,6 +11,23 @@ use serde::Serialize;
 use serde_json::Value;
 
 const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
+const INTERNAL_GOAL_CONTEXT_START: &str = "<codex_internal_context source=\"goal\">";
+const INTERNAL_CONTEXT_END: &str = "</codex_internal_context>";
+const GOAL_OBJECTIVE_START: &str = "<objective>";
+const GOAL_OBJECTIVE_END: &str = "</objective>";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseItemUserPreviewKind {
+    UserText,
+    GoalObjective,
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResponseItemUserPreview {
+    text: String,
+    kind: ResponseItemUserPreviewKind,
+}
 
 /// Apply a rollout item to the metadata structure.
 pub fn apply_rollout_item(
@@ -37,6 +55,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         RolloutItem::EventMsg(
             EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadGoalUpdated(_),
         ) => true,
+        RolloutItem::ResponseItem(ResponseItem::Message { role, .. }) if role == "user" => true,
         RolloutItem::EventMsg(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
@@ -113,7 +132,35 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
     }
 }
 
-fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
+fn apply_response_item(metadata: &mut ThreadMetadata, item: &ResponseItem) {
+    let Some(preview) = response_item_user_message_preview(item) else {
+        return;
+    };
+    let can_replace_synthetic = preview.kind == ResponseItemUserPreviewKind::GoalObjective;
+    if metadata.first_user_message.is_none()
+        || (can_replace_synthetic
+            && metadata
+                .first_user_message
+                .as_deref()
+                .is_some_and(is_synthetic_user_context))
+    {
+        metadata.first_user_message = Some(preview.text.clone());
+    }
+    if metadata.preview.is_none()
+        || (can_replace_synthetic
+            && metadata
+                .preview
+                .as_deref()
+                .is_some_and(is_synthetic_user_context))
+    {
+        metadata.preview = Some(preview.text.clone());
+    }
+    if metadata.title.is_empty()
+        || (can_replace_synthetic && is_synthetic_user_context(metadata.title.as_str()))
+    {
+        metadata.title = preview.text;
+    }
+}
 
 fn set_preview_if_empty(metadata: &mut ThreadMetadata, preview: Option<String>) {
     if metadata.preview.is_none() {
@@ -144,6 +191,71 @@ fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
     None
 }
 
+fn response_item_user_message_preview(item: &ResponseItem) -> Option<ResponseItemUserPreview> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return None;
+    };
+    if role != "user" {
+        return None;
+    }
+
+    if let Some(objective) = content.iter().find_map(|content_item| match content_item {
+        ContentItem::InputText { text } => extract_goal_objective(text),
+        ContentItem::InputImage { .. } | ContentItem::OutputText { .. } => None,
+    }) {
+        return Some(ResponseItemUserPreview {
+            text: objective,
+            kind: ResponseItemUserPreviewKind::GoalObjective,
+        });
+    }
+
+    for content_item in content {
+        match content_item {
+            ContentItem::InputText { text } => {
+                let message = strip_user_message_prefix(text);
+                if is_synthetic_user_context(message) {
+                    continue;
+                }
+                if !message.is_empty() {
+                    return Some(ResponseItemUserPreview {
+                        text: message.to_string(),
+                        kind: ResponseItemUserPreviewKind::UserText,
+                    });
+                }
+            }
+            ContentItem::InputImage { .. } => {
+                return Some(ResponseItemUserPreview {
+                    text: IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string(),
+                    kind: ResponseItemUserPreviewKind::Image,
+                });
+            }
+            ContentItem::OutputText { .. } => {}
+        }
+    }
+    None
+}
+
+fn is_synthetic_user_context(text: &str) -> bool {
+    let text = strip_user_message_prefix(text).trim_start();
+    text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("<environment_context>")
+        || text.starts_with("<codex_internal_context")
+}
+
+fn extract_goal_objective(text: &str) -> Option<String> {
+    let context_start = text.find(INTERNAL_GOAL_CONTEXT_START)?;
+    let context_after_start = &text[context_start + INTERNAL_GOAL_CONTEXT_START.len()..];
+    let context_end = context_after_start
+        .find(INTERNAL_CONTEXT_END)
+        .unwrap_or(context_after_start.len());
+    let context = &context_after_start[..context_end];
+    let objective_start = context.find(GOAL_OBJECTIVE_START)?;
+    let objective_after_start = &context[objective_start + GOAL_OBJECTIVE_START.len()..];
+    let objective_end = objective_after_start.find(GOAL_OBJECTIVE_END)?;
+    let objective = objective_after_start[..objective_end].trim();
+    (!objective.is_empty()).then(|| objective.to_string())
+}
+
 pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(Value::String(s)) => s,
@@ -155,6 +267,7 @@ pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::apply_rollout_item;
+    use super::rollout_item_affects_thread_metadata;
     use crate::model::ThreadMetadata;
     use chrono::DateTime;
     use chrono::Utc;
@@ -182,7 +295,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn response_item_user_messages_do_not_set_title_or_first_user_message() {
+    fn response_item_user_messages_set_title_and_first_user_message() {
         let mut metadata = metadata_for_test();
         let item = RolloutItem::ResponseItem(ResponseItem::Message {
             id: None,
@@ -196,6 +309,160 @@ mod tests {
 
         apply_rollout_item(&mut metadata, &item, "test-provider");
 
+        assert!(rollout_item_affects_thread_metadata(&item));
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("hello from response item")
+        );
+        assert_eq!(
+            metadata.preview.as_deref(),
+            Some("hello from response item")
+        );
+        assert_eq!(metadata.title, "hello from response item");
+    }
+
+    #[test]
+    fn response_item_goal_context_uses_objective_as_preview() {
+        let mut metadata = metadata_for_test();
+        let item = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"
+                        .to_string(),
+                },
+                ContentItem::InputText {
+                    text: r#"<codex_internal_context source="goal">
+Continue working toward the active thread goal.
+
+The objective below is user-provided data.
+
+<objective>
+Review the PR and submit every valid finding.
+</objective>
+
+</codex_internal_context>"#
+                        .to_string(),
+                },
+            ],
+            phase: None,
+            metadata: None,
+        });
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert!(rollout_item_affects_thread_metadata(&item));
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("Review the PR and submit every valid finding.")
+        );
+        assert_eq!(
+            metadata.preview.as_deref(),
+            Some("Review the PR and submit every valid finding.")
+        );
+        assert_eq!(
+            metadata.title,
+            "Review the PR and submit every valid finding."
+        );
+    }
+
+    #[test]
+    fn response_item_synthetic_context_does_not_set_user_preview() {
+        let mut metadata = metadata_for_test();
+        let item = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nRead me.\n</INSTRUCTIONS>"
+                        .to_string(),
+                },
+                ContentItem::InputText {
+                    text: "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"
+                        .to_string(),
+                },
+            ],
+            phase: None,
+            metadata: None,
+        });
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert!(rollout_item_affects_thread_metadata(&item));
+        assert_eq!(metadata.first_user_message, None);
+        assert_eq!(metadata.preview, None);
+        assert!(metadata.title.is_empty());
+    }
+
+    #[test]
+    fn response_item_goal_context_replaces_earlier_synthetic_context() {
+        let mut metadata = metadata_for_test();
+        let agents_item = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nRead me.\n</INSTRUCTIONS>"
+                    .to_string(),
+            }],
+            phase: None,
+            metadata: None,
+        });
+        let goal_item = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: r#"<codex_internal_context source="goal">
+Continue working toward the active thread goal.
+
+<objective>
+Review the PR and submit every valid finding.
+</objective>
+
+</codex_internal_context>"#
+                    .to_string(),
+            }],
+            phase: None,
+            metadata: None,
+        });
+
+        metadata.first_user_message = Some("# AGENTS.md instructions for /repo".to_string());
+        metadata.preview = Some("# AGENTS.md instructions for /repo".to_string());
+        metadata.title = "# AGENTS.md instructions for /repo".to_string();
+
+        apply_rollout_item(&mut metadata, &agents_item, "test-provider");
+        apply_rollout_item(&mut metadata, &goal_item, "test-provider");
+
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("Review the PR and submit every valid finding.")
+        );
+        assert_eq!(
+            metadata.preview.as_deref(),
+            Some("Review the PR and submit every valid finding.")
+        );
+        assert_eq!(
+            metadata.title,
+            "Review the PR and submit every valid finding."
+        );
+    }
+
+    #[test]
+    fn response_item_assistant_messages_do_not_set_title_or_first_user_message() {
+        let mut metadata = metadata_for_test();
+        let item = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "hello from assistant".to_string(),
+            }],
+            phase: None,
+            metadata: None,
+        });
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert!(!rollout_item_affects_thread_metadata(&item));
         assert_eq!(metadata.first_user_message, None);
         assert_eq!(metadata.preview, None);
         assert_eq!(metadata.title, "");

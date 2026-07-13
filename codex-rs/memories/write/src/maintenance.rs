@@ -146,13 +146,9 @@ pub async fn maintain_memories(
     )
     .await;
     let phase1_has_blockers = phase1_report.has_blockers();
-    let phase1_has_failures = phase1_report.has_failures();
     report.phase1 = Some(phase1_report);
     if phase1_has_blockers {
         return Ok(report.with_status("blocked_phase1_jobs"));
-    }
-    if phase1_has_failures {
-        return Ok(report.with_status("failed_phase1"));
     }
 
     let phase2_report = phase2::run_for_maintenance(Arc::clone(&context), config).await;

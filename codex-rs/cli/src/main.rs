@@ -2116,6 +2116,9 @@ async fn run_memory_maintain_command(
     config.ephemeral = false;
     config.memories.generate_memories = false;
     config.memories.use_memories = false;
+    config.codex_self_exe = arg0_paths.codex_self_exe.clone();
+    config.codex_linux_sandbox_exe = arg0_paths.codex_linux_sandbox_exe.clone();
+    config.main_execve_wrapper_exe = arg0_paths.main_execve_wrapper_exe.clone();
     let config = Arc::new(config);
 
     let auth_manager =

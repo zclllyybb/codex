@@ -1477,7 +1477,8 @@ async fn test_source_filter_excludes_non_matching_sessions() {
     let home = temp.path();
 
     let interactive_id = Uuid::from_u128(42);
-    let non_interactive_id = Uuid::from_u128(77);
+    let exec_id = Uuid::from_u128(77);
+    let non_interactive_id = Uuid::from_u128(88);
 
     write_session_file(
         home,
@@ -1490,9 +1491,17 @@ async fn test_source_filter_excludes_non_matching_sessions() {
     write_session_file(
         home,
         "2025-08-01T10-00-00",
-        non_interactive_id,
+        exec_id,
         /*num_records*/ 2,
         Some(SessionSource::Exec),
+    )
+    .unwrap();
+    write_session_file(
+        home,
+        "2025-07-31T10-00-00",
+        non_interactive_id,
+        /*num_records*/ 2,
+        Some(SessionSource::Mcp),
     )
     .unwrap();
 
@@ -1515,9 +1524,15 @@ async fn test_source_filter_excludes_non_matching_sessions() {
         .map(|item| item.path.as_path())
         .collect();
 
-    assert_eq!(paths.len(), 1);
-    assert!(paths.iter().all(|path| {
+    assert_eq!(paths.len(), 2);
+    assert!(paths.iter().any(|path| {
         path.ends_with("rollout-2025-08-02T10-00-00-00000000-0000-0000-0000-00000000002a.jsonl")
+    }));
+    assert!(paths.iter().any(|path| {
+        path.ends_with("rollout-2025-08-01T10-00-00-00000000-0000-0000-0000-00000000004d.jsonl")
+    }));
+    assert!(paths.iter().all(|path| {
+        !path.ends_with("rollout-2025-07-31T10-00-00-00000000-0000-0000-0000-000000000058.jsonl")
     }));
 
     let all_sessions = get_threads(
@@ -1537,12 +1552,15 @@ async fn test_source_filter_excludes_non_matching_sessions() {
         .into_iter()
         .map(|item| item.path)
         .collect();
-    assert_eq!(all_paths.len(), 2);
+    assert_eq!(all_paths.len(), 3);
     assert!(all_paths.iter().any(|path| {
         path.ends_with("rollout-2025-08-02T10-00-00-00000000-0000-0000-0000-00000000002a.jsonl")
     }));
     assert!(all_paths.iter().any(|path| {
         path.ends_with("rollout-2025-08-01T10-00-00-00000000-0000-0000-0000-00000000004d.jsonl")
+    }));
+    assert!(all_paths.iter().any(|path| {
+        path.ends_with("rollout-2025-07-31T10-00-00-00000000-0000-0000-0000-000000000058.jsonl")
     }));
 }
 

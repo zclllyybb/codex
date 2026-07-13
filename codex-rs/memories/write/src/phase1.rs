@@ -71,10 +71,7 @@ pub struct Phase1DrainReport {
 
 impl Phase1DrainReport {
     pub fn has_blockers(&self) -> bool {
-        !self.skipped_running.is_empty()
-            || !self.skipped_retry_backoff.is_empty()
-            || !self.skipped_retry_exhausted.is_empty()
-            || self.infrastructure_error.is_some()
+        !self.skipped_running.is_empty() || self.infrastructure_error.is_some()
     }
 
     pub fn has_failures(&self) -> bool {
@@ -218,7 +215,7 @@ pub(crate) async fn drain_for_maintenance(
             counts.failed
         );
         report.add_stats(counts);
-        if report.has_failures() || report.has_blockers() {
+        if report.has_blockers() {
             return report;
         }
     }
@@ -390,6 +387,21 @@ mod job {
         {
             Ok(output) => output,
             Err(reason) => {
+                if is_context_window_error(&reason) {
+                    tracing::warn!(
+                        "Phase 1 job produced no output for thread {} due to context window limit: {reason}",
+                        claimed_thread.id
+                    );
+                    return JobResult {
+                        outcome: result::no_output(
+                            context,
+                            claimed_thread.id,
+                            &claim.ownership_token,
+                        )
+                        .await,
+                        token_usage: None,
+                    };
+                }
                 result::failed(
                     context,
                     claimed_thread.id,
@@ -425,6 +437,14 @@ mod job {
             .await,
             token_usage,
         }
+    }
+
+    pub(super) fn is_context_window_error(reason: &anyhow::Error) -> bool {
+        let reason = reason.to_string().to_ascii_lowercase();
+        reason.contains("context window")
+            || reason.contains("context_length_exceeded")
+            || reason.contains("maximum context length")
+            || reason.contains("too many tokens")
     }
 
     /// Extract the rollout and perform the actual sampling.
@@ -938,6 +958,45 @@ mod tests {
     }
 
     #[test]
+    fn retryable_stage1_errors_do_not_block_maintenance() {
+        let mut report = Phase1DrainReport {
+            stats: Stats {
+                failed: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        report
+            .skipped_retry_backoff
+            .push(memory_job_snapshot("retry_backoff"));
+        report
+            .skipped_retry_exhausted
+            .push(memory_job_snapshot("retry_exhausted"));
+
+        assert!(!report.has_blockers());
+        assert!(report.has_failures());
+    }
+
+    #[test]
+    fn running_stage1_jobs_still_block_maintenance() {
+        let mut report = Phase1DrainReport::default();
+        report.skipped_running.push(memory_job_snapshot("running"));
+
+        assert!(report.has_blockers());
+    }
+
+    #[test]
+    fn context_window_errors_are_no_output_candidates() {
+        let reason = anyhow::anyhow!(
+            "Codex ran out of room in the model's context window. Start a new thread."
+        );
+        assert!(job::is_context_window_error(&reason));
+
+        let reason = anyhow::anyhow!("unexpected status 403 Forbidden");
+        assert!(!job::is_context_window_error(&reason));
+    }
+
+    #[test]
     fn count_outcomes_sums_token_usage_across_all_jobs() {
         let counts = aggregate_stats(vec![
             JobResult {
@@ -997,5 +1056,22 @@ mod tests {
 
         assert_eq!(counts.claimed, 2);
         assert_eq!(counts.total_token_usage, None);
+    }
+
+    fn memory_job_snapshot(status: &str) -> codex_state::MemoryJobSnapshot {
+        codex_state::MemoryJobSnapshot {
+            kind: "memory_stage1".to_string(),
+            job_key: "thread".to_string(),
+            status: status.to_string(),
+            worker_id: None,
+            started_at: None,
+            finished_at: None,
+            lease_until: None,
+            retry_at: None,
+            retry_remaining: 1,
+            last_error: None,
+            input_watermark: None,
+            last_success_watermark: None,
+        }
     }
 }

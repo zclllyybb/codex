@@ -26,6 +26,7 @@ pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
     vec![
         SessionSource::Cli,
+        SessionSource::Exec,
         SessionSource::VSCode,
         SessionSource::Custom("atlas".to_string()),
         SessionSource::Custom("chatgpt".to_string()),

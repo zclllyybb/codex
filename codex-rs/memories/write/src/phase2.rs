@@ -516,7 +516,11 @@ mod agent {
             ..Default::default()
         };
 
-        if matches!(final_status, AgentStatus::Completed(_)) {
+        if let Some(reason) = completed_status_failure_reason(&final_status) {
+            job::failed(context.as_ref(), &db, &claim, "failed_agent").await;
+            report.status = "failed_agent".to_string();
+            report.failure_reason = Some(reason.to_string());
+        } else if matches!(final_status, AgentStatus::Completed(_)) {
             if let Some(token_usage) = thread
                 .token_usage_info()
                 .await
@@ -599,6 +603,19 @@ mod agent {
         }
 
         report
+    }
+
+    pub(super) fn completed_status_failure_reason(status: &AgentStatus) -> Option<&'static str> {
+        let AgentStatus::Completed(Some(message)) = status else {
+            return None;
+        };
+        let normalized = message.to_ascii_lowercase();
+        let known_execution_blocker = normalized.contains("landlocksandboxexecutable")
+            || normalized.contains("missing codex-linux-sandbox executable path")
+            || normalized.contains("sandbox executable")
+            || (normalized.contains("blocked by the execution environment")
+                && normalized.contains("exec_command"));
+        known_execution_blocker.then_some("consolidation agent reported an execution blocker")
     }
 
     async fn loop_agent(
@@ -739,6 +756,8 @@ fn emit_token_usage_metrics(context: &MemoryStartupContext, token_usage: &TokenU
 #[cfg(test)]
 mod tests {
     use super::Phase2Report;
+    use super::agent::completed_status_failure_reason;
+    use codex_protocol::protocol::AgentStatus;
 
     #[test]
     fn phase2_report_success_requires_completed_consolidation() {
@@ -746,5 +765,20 @@ mod tests {
         assert!(Phase2Report::status("succeeded_no_workspace_changes").succeeded());
         assert!(!Phase2Report::status("agent_spawned").succeeded());
         assert!(!Phase2Report::failure("failed_agent", "boom").succeeded());
+    }
+
+    #[test]
+    fn completed_status_failure_reason_detects_execution_blockers() {
+        let blocked = AgentStatus::Completed(Some(
+            "I am blocked by the execution environment: Codex(LandlockSandboxExecutableNotProvided)"
+                .to_string(),
+        ));
+        assert_eq!(
+            completed_status_failure_reason(&blocked),
+            Some("consolidation agent reported an execution blocker")
+        );
+
+        let completed = AgentStatus::Completed(Some("phase2 complete".to_string()));
+        assert_eq!(completed_status_failure_reason(&completed), None);
     }
 }
